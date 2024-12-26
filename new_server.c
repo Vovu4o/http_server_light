@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <errno.h>
 #include <signal.h>
 
@@ -37,20 +38,17 @@ const char* get_mime_type(const char *path) {
         return "image/jpeg";
     } else if (strstr(path, ".png")) {
         return "image/png";
-    } else if (strstr(path, ".gif")) {
-        return "image/gif";
     } else if (strstr(path, ".zip")) {
         return "application/zip";
-    } else if (strstr(path, ".css")) {
-        return "text/css";
+    } else if (strstr(path, ".py") || strstr(path, ".c") ||
+            strstr(path, ".h") || strstr(path, ".txt")) {
+        return "text/plain";
     } else if (strstr(path, ".js")) {
         return "application/javascript";
-    } else if (strstr(path, ".json")) {
-        return "application/json";
     } else if (strstr(path, ".pdf")) {
         return "application/pdf";
-    } else if (strstr(path, ".txt")) {
-        return "text/plain";
+    } else if (strstr(path, ".css")) {
+        return "text/css";
     }
     return "application/octet-stream";  // Default MIME type
 }
@@ -58,14 +56,15 @@ const char* get_mime_type(const char *path) {
 // Функция для обработки HTTP-запроса
 void handle_request(int client_sock) {
     char buffer[2048];
-    ssize_t bytes_received = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
+    ssize_t bytes_received = recv(client_sock, buffer, sizeof(buffer) - 1, 0); // получаем сообщение из сокета, в случае успеха записываем
+    // его длину
     if (bytes_received < 0) {
         perror("recv");
         close(client_sock);
         return;
     }
 
-    buffer[bytes_received] = '\0';  // Завершаем строку
+    buffer[bytes_received] = '\0';  // Завершаем строку запроса
     printf("Request: %s\n", buffer); // Выводим запрос в консоль
 
     // Извлекаем метод и путь из запроса
@@ -87,9 +86,26 @@ void handle_request(int client_sock) {
     }
 
     // Преобразуем путь в абсолютный путь на файловой системе
-    char file_path[1024];
-    snprintf(file_path, sizeof(file_path), "./%s", path);  // Считываем файл относительно текущей директории
+    char file_path[1024 * 2]; // пофиксить
+    size_t buffer_size = 1024;
+    char *cur_dir = mmap(NULL, buffer_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
+    if (cur_dir == MAP_FAILED) {
+        perror("Ошибка при выделении памяти через mmap");
+    }
+
+    if (getcwd(cur_dir, buffer_size) != NULL) {
+        snprintf(file_path, sizeof(file_path) + sizeof(cur_dir), "%s", strcat(strcat(cur_dir, "/"), path));
+    } else {
+        perror("Ошибка при получении текущей директории");
+    }
+
+
+    if (munmap(cur_dir, buffer_size) == -1) {
+        perror("Ошибка при освобождении памяти");
+    }
+    //snprintf(file_path, sizeof(file_path), "./%s", path);  // Считываем файл относительно текущей директории
+    printf("%s\n", file_path);
     // Получаем информацию о файле
     struct stat st;
     if (stat(file_path, &st) < 0) {
@@ -102,7 +118,9 @@ void handle_request(int client_sock) {
             close(client_sock);
             return;
         }
-    } else if (S_ISDIR(st.st_mode)) {
+    } else if (S_ISDIR(st.st_mode)  || // запрет на директории
+    (strstr(file_path, "../")) || (strstr(file_path, "?")) || (strstr(file_path, "'")) ||
+            (strstr(file_path, "\""))) {
         // Если это директория, показываем 403 (Forbidden)
         const char *body = "<html><body><h1>403 Forbidden</h1></body></html>";
         send_response(client_sock, "HTTP/1.1 403 Forbidden\r\n", "text/html", body, strlen(body));
@@ -143,7 +161,7 @@ void handle_request(int client_sock) {
 
 // Обработчик сигнала SIGCHLD для предотвращения зомби-процессов
 void sigchld_handler(int signum) {
-    (void)signum; // Не используем параметр signum
+
     while (waitpid(-1, NULL, WNOHANG) > 0); // Ожидаем завершения всех дочерних процессов
 }
 
@@ -152,12 +170,9 @@ int main() {
     // Настроим обработчик сигнала SIGCHLD, чтобы избежать зомби-процессов
     struct sigaction sa;
     sa.sa_handler = sigchld_handler;
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; // Перезапуск системных вызовов
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-        perror("sigaction");
-        exit(EXIT_FAILURE);
-    }
+    sigaction(SIGCHLD, &sa, NULL);
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) {
@@ -165,18 +180,26 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    int opt = 1;
+    // делаем порт вновь используемым
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
+        perror("setsockopt failed");
+        close(server_sock);
+        exit(EXIT_FAILURE);
+    }
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
+    // привязка сокета к хосту и порту
     if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
         close(server_sock);
         exit(EXIT_FAILURE);
     }
-
-    if (listen(server_sock, 10) < 0) {
+    // слушаем сокет
+    if (listen(server_sock, 20) < 0) {
         perror("listen");
         close(server_sock);
         exit(EXIT_FAILURE);
@@ -201,10 +224,11 @@ int main() {
         } else if (pid > 0) {
             // Родительский процесс
             close(client_sock);
-            // waitpid() больше не нужен, так как обработка SIGCHLD уже решает проблему
+
         } else {
             perror("fork");
             close(client_sock);
+            exit(EXIT_FAILURE);
         }
     }
 
